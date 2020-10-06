@@ -38,8 +38,7 @@ inline module_t construct(
 	context::handle_t context_handle,
 	handle_t handle,
 	link::options_t options,
-	bool take_ownership = false,
-	bool hold_primary_context_reference = false) noexcept;
+	bool take_ownership = false) noexcept;
 
 inline ::std::string identify(const module::handle_t &handle)
 {
@@ -82,16 +81,18 @@ module_t load_from_file(const ::std::filesystem::path& path, link::options_t opt
  *
  * @param[inout] context The CUDA context into which the module data will be loaded (and
  *     in which the module contents may be used)
- *     @parem[in
- * The pointer may be obtained by mapping a cubin or PTX or fatbin file, passing a cubin or PTX or fatbin file as a NULL-terminated text string, or incorporating a cubin or fatbin object into the executable resources and using operating system calls such as Windows FindResource() to obtain the pointer.
+ * @param[inout] primary_context The CUDA context, being primary on its device, into which
+ *     the module data will be loaded (and in which the module contents may be used); this is
+ *     handled distinctly from a regular context, in that the primary context must be kept
+ *     alive until the module has been destroyed.
+ * @param[in] module_data the opaque, raw binary data for the module - in a contiguous container
+ *     such as a span, a cuda::dynarray etc..
  */
 ///@{
-module_t create(context_t context, const void* module_data, link::options_t link_options);
-module_t create(context_t context, const void* module_data);
-module_t create(device_t device, const void* module_data, link::options_t link_options);
-module_t create(device_t device, const void* module_data);
-template <typename ContiguousContainer>
-module_t create(context_t context, ContiguousContainer module_data);
+template <typename Locus, typename ContiguousContainer>
+module_t create(Locus locus, ContiguousContainer module_data, link::options_t link_options);
+template <typename Locus, typename ContiguousContainer>
+module_t create(Locus locus, ContiguousContainer module_data);
 ///@}
 
 } // namespace module
@@ -137,35 +138,15 @@ protected: // constructors
 		context::handle_t context,
 		module::handle_t handle,
 		link::options_t options,
-		bool owning,
-		bool hold_primary_context_reference)
-#ifdef NDEBUG
+		bool owning)
 		noexcept
-#endif
-		: device_id_(device_id), context_handle_(context), handle_(handle), options_(options), owning_(owning),
-		  holds_primary_context_refcount_unit_(hold_primary_context_reference)
-	{
-#ifndef NDEBUG
-		if (not owning and hold_primary_context_reference) {
-			throw std::invalid_argument("A non-owning module proxy should not try to hold its own primary context refcount unit");
-		}
-		if (hold_primary_context_reference and not context::detail_::is_primary(context_handle_))
-		{
-			throw std::invalid_argument("A module in a non-primary context should not presume to hold a primary context refcount unit");
-		}
-#endif
-		if (owning and hold_primary_context_reference) {
-			device::primary_context::detail_::increase_refcount(device_id);
-		}
-	}
-
-	module_t(device::id_t device_id, context::handle_t context, module::handle_t handle, link::options_t options, bool owning) noexcept
-	: module_t(device_id, context, handle, options, owning, false)
+		: device_id_(device_id), context_handle_(context), handle_(handle), options_(options), owning_(owning)
 	{ }
+
 
 public: // friendship
 
-	friend module_t module::detail_::construct(device::id_t, context::handle_t, module::handle_t, link::options_t, bool, bool) noexcept;
+	friend module_t module::detail_::construct(device::id_t, context::handle_t, module::handle_t, link::options_t, bool) noexcept;
 
 
 public: // constructors and destructor
@@ -178,16 +159,15 @@ public: // constructors and destructor
 		other.owning_ = false;
 	};
 
+	// Note: It is up to the user of this class to ensure that it is destroyed _before_ the context
+	// in which it was created; and one needs to be particularly careful about this point w.r.t.
+	// primary contexts
 	~module_t()
 	{
 		if (owning_) {
 			context::current::detail_::scoped_override_t set_context_for_this_scope(context_handle_);
 			auto status = cuModuleUnload(handle_);
 		 	throw_if_error(status, "Failed unloading " + module::detail_::identify(*this));
-
-			if (holds_primary_context_refcount_unit_) {
-				device::primary_context::detail_::decrease_refcount(device_id_);
-			}
 		}
 	}
 
@@ -204,7 +184,6 @@ protected: // data members
 	bool               owning_;
 		// this field is mutable only for enabling move construction; other
 		// than in that case it must not be altered
-	bool               holds_primary_context_refcount_unit_;
 };
 
 namespace module {
@@ -252,14 +231,13 @@ inline module_t construct(
 	context::handle_t context_handle,
 	handle_t module_handle,
 	link::options_t options,
-	bool take_ownership,
-	bool hold_primary_context_reference) noexcept
+	bool take_ownership) noexcept
 {
-	return module_t{device_id, context_handle, module_handle, options, take_ownership, hold_primary_context_reference};
+	return module_t{device_id, context_handle, module_handle, options, take_ownership};
 }
 
 template <typename Creator>
-inline module_t create(const context_t& context, const void* module_data, Creator creator_function, bool hold_pc_reference)
+inline module_t create(const context_t& context, const void* module_data, Creator creator_function)
 {
 	context::current::scoped_override_t set_context_for_this_scope(context);
 	handle_t new_module_handle;
@@ -270,11 +248,11 @@ inline module_t create(const context_t& context, const void* module_data, Creato
 	bool do_take_ownership { true };
 	// TODO: Make sure the default-constructed options correspond to what cuModuleLoadData uses as defaults
 	return detail_::construct(context.device_id(), context.handle(), new_module_handle,
-		link::options_t{}, do_take_ownership, hold_pc_reference);
+		link::options_t{}, do_take_ownership);
 }
 
 // TODO: Consider adding create_module() methods to context_t
-inline module_t create(const context_t& context, const void* module_data, const link::options_t& link_options, bool hold_pc_reference)
+inline module_t create(const context_t& context, const void* module_data, const link::options_t& link_options)
 {
 	auto creator_function =
 		[&link_options](handle_t& new_module_handle, const void* module_data) {
@@ -287,56 +265,22 @@ inline module_t create(const context_t& context, const void* module_data, const 
 				const_cast<void **>(marshalled_options.values())
 			);
 		};
-	return detail_::create(context, module_data, creator_function, hold_pc_reference);
+	return detail_::create(context, module_data, creator_function);
 }
 
-inline module_t create(const context_t& context, const void* module_data, bool hold_pc_reference)
+inline module_t create(const context_t& context, const void* module_data)
 {
 	auto creator_function =
 		[](handle_t& new_module_handle, const void* module_data) {
 			return cuModuleLoadData(&new_module_handle, module_data);
 		};
-	return detail_::create(context, module_data, creator_function, hold_pc_reference);
+	return detail_::create(context, module_data, creator_function);
 }
 
 } // namespace detail_
 
 // TODO: Use an optional to reduce the number of functions here... when the
 // library starts requiring C++14.
-
-inline module_t create(context_t context, const void* module_data)
-{
-	return detail_::create(context, module_data, false);
-}
-
-inline module_t create(context_t context, const void* module_data, link::options_t link_options)
-{
-	return detail_::create(context, module_data, link_options, false);
-}
-
-inline module_t create(device::primary_context_t primary_context, const void* module_data)
-{
-#ifndef NDEBUG
-	if (module_data == nullptr) {
-		throw std::invalid_argument("Attempt to create a module with a null pointer for its data");
-	}
-#endif
-	constexpr const bool do_hold_primary_context_reference { true };
-	const context_t& context = primary_context;
-	return detail_::create(context, module_data, do_hold_primary_context_reference);
-}
-
-inline module_t create(device::primary_context_t primary_context, const void* module_data, link::options_t link_options)
-{
-#ifndef NDEBUG
-	if (module_data == nullptr) {
-		throw std::invalid_argument("Attempt to create a module with a null pointer for its data");
-	}
-#endif
-	constexpr const bool do_hold_primary_context_reference {true };
-	const context_t& context = primary_context;
-	return detail_::create(context, module_data, link_options, do_hold_primary_context_reference);
-}
 
 namespace detail_ {
 
@@ -345,7 +289,29 @@ inline ::std::string identify(const module_t& module)
 	return identify(module.handle(), module.context_handle(), module.device().id());
 }
 
+// Note: The following may create the primary context of a device!
+template <typename Locus> context_t get_context_for(Locus locus) = delete;
+
+template <> context_t get_context_for<context_t>(context_t locus) { return locus; }
+
 } // namespace detail_
+
+// Note: The following may create the primary context of a device!
+template <typename Locus, typename ContiguousContainer>
+module_t create(Locus locus, ContiguousContainer module_data, link::options_t link_options)
+{
+	return detail_::create(detail_::get_context_for(locus), module_data.data(), link_options);
+}
+
+// Note: The following may create the primary context of a device!
+template <typename Locus, typename ContiguousContainer>
+module_t create(Locus locus, ContiguousContainer module_data)
+{
+	return detail_::create(detail_::get_context_for(locus), module_data.data());
+}
+
+template <typename ContiguousContainer>
+module_t create(device::primary_context_t locus, ContiguousContainer module_data) = delete;
 
 } // namespace module
 

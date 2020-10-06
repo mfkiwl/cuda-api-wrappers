@@ -168,16 +168,6 @@ inline bool context_t::is_primary() const
 	return handle_ == pc_handle;
 }
 
-inline module_t context_t::create_module(const void* module_data, link::options_t link_options) const
-{
-	return module::create(*this, module_data, link_options);
-}
-
-inline module_t context_t::create_module(const void* module_data) const
-{
-	return module::create(*this, module_data);
-}
-
 template <typename ContiguousContainer>
 module_t context_t::create_module(ContiguousContainer module_data) const
 {
@@ -1611,15 +1601,11 @@ inline void typed_set(T* start, const T& value, size_t num_elements)
 
 namespace module {
 
-inline module_t create(device_t device, const void* module_data, link::options_t link_options)
-{
-	return create(device.primary_context(), module_data, link_options);
-}
+namespace detail_{
 
-inline module_t create(device_t device, const void* module_data)
-{
-	return create(device.primary_context(), module_data);
-}
+template <> context_t get_context_for<device_t>(device_t locus) { return locus.primary_context(); }
+
+} // namespace detail_
 
 } // namespace module
 
